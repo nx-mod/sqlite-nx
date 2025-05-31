@@ -1,5 +1,7 @@
 #include "sqlite3.h"
 #include <switch.h>
+#include <string.h>
+#include <stdio.h>
 
 // Important points:
 // - There is no file truncation
@@ -178,7 +180,8 @@ static int nxLock(sqlite3_file * pFile, int lock) {
 static int nxUnlock(sqlite3_file * pFile, int lock) {
     return SQLITE_OK;
 }
-static int nxCheckReservedLock(sqlite3_file * pFile, int lock) {
+static int nxCheckReservedLock(sqlite3_file * pFile, int * pResOut) {
+    *pResOut = 0;
     return SQLITE_OK;
 }
 
