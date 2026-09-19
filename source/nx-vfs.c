@@ -3,16 +3,25 @@
 #include <string.h>
 #include <stdio.h>
 
-// Important points:
-// - There is no file truncation
-//   -> journal_mode=truncate won't work
-// - There is no file locking
-//   -> as far as I know Horizon doesn't support it?
-// - Doesn't support temp files
-// - Doesn't support dynamic libraries (not my fault)
+// SQLite VFS on libnx's FsFileSystem, bypassing newlib's POSIX layer.
+//
+// - Paths are SD card paths: "/dir/file.db", or "sdmc:/dir/file.db".
+// - No file locking (Horizon has none), so one process per database.
+// - No temp files: build with SQLITE_TEMP_STORE=3 so SQLite keeps them in memory.
+// - No shared memory, so no WAL: use journal_mode=MEMORY, DELETE or TRUNCATE.
+// - No dynamic libraries.
 
-// FsFileSystem used to interact with files on SD Card
+// FsFileSystem used to interact with files on the SD card
 static FsFileSystem fs;
+
+// libnx takes paths relative to the filesystem root; accept the "sdmc:"
+// device prefix newlib users naturally pass.
+static const char * nxPath(const char * path) {
+    if (strncmp(path, "sdmc:", 5) == 0) {
+        return path + 5;
+    }
+    return path;
+}
 
 // Size of write buffer (in bytes)
 #define SQLITE_NXVFS_BUFFERSZ 8192
@@ -28,10 +37,15 @@ struct nxFile {
 };
 
 // Close a file
+static int nxFlushBuffer(nxFile * file);
+
 static int nxClose(sqlite3_file * pFile) {
     nxFile * file = (nxFile *) pFile;
+    int rc = nxFlushBuffer(file);   // Buffered writes must reach the file
     fsFileClose(&file->file);
-    return SQLITE_OK;
+    sqlite3_free(file->buf);
+    file->buf = NULL;
+    return rc;
 }
 
 // Read data from a file
@@ -54,15 +68,11 @@ static int nxRead(sqlite3_file * pFile, void * buf, int bytes, sqlite_int64 offs
         return SQLITE_OK;
 
     // Zero-pad the remaining buffer if not enough bytes were read
-    } else if (read >= 0) {
-        if (read < bytes) {
-            memset(&((char *) buf)[read], 0, bytes-read);
-        }
-        return SQLITE_IOERR_SHORT_READ;
     }
 
-    // Don't think this should be reached?
-    return SQLITE_IOERR_READ;
+    // Short read: SQLite requires the rest of the buffer zeroed
+    memset(&((char *) buf)[read], 0, bytes - read);
+    return SQLITE_IOERR_SHORT_READ;
 }
 
 // Write to a file (and flush immediately)
@@ -78,11 +88,13 @@ static int nxDirectWrite(nxFile * file, const void * buf, int bytes, sqlite_int6
 }
 
 // Flush file's buffer to disk (no-op if buffer is empty)
+// Keeps the buffer allocated: clearing the pointer here used to make the
+// next buffered write copy through NULL, and leaked the buffer.
 static int nxFlushBuffer(nxFile * file) {
     int rc = SQLITE_OK;
-    if (file->buf) {
+    if (file->buf && file->bufSize > 0) {
         rc = nxDirectWrite(file, file->buf, file->bufSize, file->bufOffset);
-        file->buf = NULL;
+        file->bufSize = 0;
     }
     return rc;
 }
@@ -132,10 +144,14 @@ static int nxWrite(sqlite3_file * pFile, const void * buf, int bytes, sqlite_int
     return SQLITE_OK;
 }
 
-// This is meant to truncate a file (maybe I'll get to it later)
-// This means that journal_mode=truncate is not supported
 static int nxTruncate(sqlite3_file * pFile, sqlite_int64 size) {
-    return SQLITE_OK;
+    nxFile * file = (nxFile *) pFile;
+    int tmp = nxFlushBuffer(file);
+    if (tmp != SQLITE_OK) {
+        return tmp;
+    }
+    Result rc = fsFileSetSize(&file->file, size);
+    return (R_SUCCEEDED(rc) ? SQLITE_OK : SQLITE_IOERR_TRUNCATE);
 }
 
 // Sync contents of file to the disk
@@ -234,9 +250,11 @@ static int nxOpen(sqlite3_vfs * vfs, const char * path, sqlite3_file * pFile, in
         }
     }
 
-    // Create file if flag is set
+    path = nxPath(path);
+
+    // Create file if flag is set (fails harmlessly if it already exists)
     if (flags & SQLITE_OPEN_CREATE) {
-        rc = fsFsCreateFile(&fs, path, 0, 0);
+        fsFsCreateFile(&fs, path, 0, 0);
     }
 
     // Choose mode based on flags
@@ -244,14 +262,14 @@ static int nxOpen(sqlite3_vfs * vfs, const char * path, sqlite3_file * pFile, in
     if (flags & SQLITE_OPEN_READONLY) {
         mode |= FsOpenMode_Read;
     } else if (flags & SQLITE_OPEN_READWRITE) {
-        mode |= FsOpenMode_Read;
-        mode |= FsOpenMode_Write;
+        // Append lets writes extend the file; without it Horizon rejects any
+        // write past the current end, so a database could never grow.
+        mode |= FsOpenMode_Read | FsOpenMode_Write | FsOpenMode_Append;
     }
 
     // Allocate memory for file object and open
     memset(pFile, 0, sizeof(nxFile));
     rc = fsFsOpenFile(&fs, path, mode, &file->file);
-    printf("%s: %i %i\n", path, R_MODULE(rc), R_DESCRIPTION(rc));
     if (R_FAILED(rc)) {
         file->base.pMethods = NULL;     // Prevents nxClose being called
         sqlite3_free(tmpBuf);
@@ -269,7 +287,7 @@ static int nxOpen(sqlite3_vfs * vfs, const char * path, sqlite3_file * pFile, in
 
 // Delete the given file
 static int nxDelete(sqlite3_vfs * vfs, const char * path, int sync) {
-    Result rc = fsFsDeleteFile(&fs, path);
+    Result rc = fsFsDeleteFile(&fs, nxPath(path));
 
     // Commit changes if flag set
     if (R_SUCCEEDED(rc) && sync) {
@@ -280,27 +298,26 @@ static int nxDelete(sqlite3_vfs * vfs, const char * path, int sync) {
 }
 
 // Check if the file exists
+// "Does it exist?" is a question, not an error: SQLite asks it about journal
+// files that are normally absent, and reporting absence as SQLITE_IOERR turned
+// ordinary opens into "disk I/O error". Readable/writable are assumed for any
+// file that exists.
 static int nxAccess(sqlite3_vfs * vfs, const char * path, int flags, int * out) {
-    // Only check exists flag, fake the other ones
-    if (flags & SQLITE_ACCESS_EXISTS) {
-        FsDirEntryType type = FsDirEntryType_Dir;
-        Result rc = fsFsGetEntryType(&fs, path, &type);
-        if (R_FAILED(rc) || type != FsDirEntryType_File) {
-            return SQLITE_IOERR_ACCESS;
-        }
-    }
-
+    FsDirEntryType type = FsDirEntryType_Dir;
+    Result rc = fsFsGetEntryType(&fs, nxPath(path), &type);
+    *out = (R_SUCCEEDED(rc) && type == FsDirEntryType_File) ? 1 : 0;
     return SQLITE_OK;
 }
 
 // Simply returns the given path (should return full path though)
+// Paths are already absolute on the SD card; copy with the terminator, and
+// never past either buffer (the old version copied outBytes from a shorter path).
 static int nxFullPathname(sqlite3_vfs * vfs, const char * path, int outBytes, char * outPath) {
-    int num = strlen(path);
-    if (outBytes > num) {
-        num = outBytes;
+    int num = (int) strlen(path);
+    if (num + 1 > outBytes) {
+        return SQLITE_CANTOPEN;
     }
-    memcpy(outPath, path, num);
-
+    memcpy(outPath, path, num + 1);
     return SQLITE_OK;
 }
 
@@ -343,6 +360,64 @@ static int nxCurrentTime(sqlite3_vfs * vfs, double * time) {
     return SQLITE_OK;
 }
 
+// Mutexes on libnx. SQLITE_OS_OTHER ships only no-op mutexes, so without
+// these a thread-safe build would not actually be thread-safe. Every mutex is
+// recursive (RMutex), which also satisfies SQLITE_MUTEX_FAST.
+struct sqlite3_mutex {
+    RMutex lock;
+};
+
+// Static mutex ids run from 2 (STATIC_MAIN, named STATIC_MASTER before 3.33)
+// through SQLITE_MUTEX_STATIC_VFS3.
+#define NX_STATIC_MUTEX_FIRST 2
+#define NX_STATIC_MUTEX_COUNT (SQLITE_MUTEX_STATIC_VFS3 - NX_STATIC_MUTEX_FIRST + 1)
+static sqlite3_mutex nxStaticMutexes[NX_STATIC_MUTEX_COUNT];
+
+static int nxMutexInit(void) {
+    for (int i = 0; i < NX_STATIC_MUTEX_COUNT; i++) {
+        rmutexInit(&nxStaticMutexes[i].lock);
+    }
+    return SQLITE_OK;
+}
+static int nxMutexEnd(void) {
+    return SQLITE_OK;
+}
+static sqlite3_mutex * nxMutexAlloc(int id) {
+    if (id == SQLITE_MUTEX_FAST || id == SQLITE_MUTEX_RECURSIVE) {
+        sqlite3_mutex * mutex = (sqlite3_mutex *) sqlite3_malloc(sizeof(sqlite3_mutex));
+        if (mutex) {
+            rmutexInit(&mutex->lock);
+        }
+        return mutex;
+    }
+    if (id >= NX_STATIC_MUTEX_FIRST && id < NX_STATIC_MUTEX_FIRST + NX_STATIC_MUTEX_COUNT) {
+        return &nxStaticMutexes[id - NX_STATIC_MUTEX_FIRST];
+    }
+    return NULL;
+}
+static void nxMutexFree(sqlite3_mutex * mutex) {
+    sqlite3_free(mutex);
+}
+static void nxMutexEnter(sqlite3_mutex * mutex) {
+    rmutexLock(&mutex->lock);
+}
+static int nxMutexTry(sqlite3_mutex * mutex) {
+    return rmutexTryLock(&mutex->lock) ? SQLITE_OK : SQLITE_BUSY;
+}
+static void nxMutexLeave(sqlite3_mutex * mutex) {
+    rmutexUnlock(&mutex->lock);
+}
+
+// Installed before main: sqlite3_config() must run before SQLite initializes,
+// and sqlite3_os_init() is already too late for it.
+__attribute__((constructor)) static void nxInstallMutexes(void) {
+    static const sqlite3_mutex_methods methods = {
+        nxMutexInit, nxMutexEnd, nxMutexAlloc, nxMutexFree,
+        nxMutexEnter, nxMutexTry, nxMutexLeave, NULL, NULL,
+    };
+    sqlite3_config(SQLITE_CONFIG_MUTEX, &methods);
+}
+
 // Returns a pointer to this VFS so it can be used
 sqlite3_vfs * sqlite3_nxvfs() {
     static sqlite3_vfs nxvfs = {
@@ -369,7 +444,7 @@ sqlite3_vfs * sqlite3_nxvfs() {
 
 // Opens the FsFileSystem and registers the VFS
 SQLITE_API int sqlite3_os_init() {
-    Result rc = fsOpenImageDirectoryFileSystem(&fs, FsImageDirectoryId_Sd);
+    Result rc = fsOpenSdCardFileSystem(&fs);
     if (R_FAILED(rc)) {
         return SQLITE_ERROR;
     }

@@ -1,0 +1,28 @@
+name: switch
+
+# Builds libSQLite.a with the Switch VFS and the demo NRO that exercises it.
+on:
+  push:
+    branches: [switch]
+  pull_request:
+    branches: [switch]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Library
+        run: make -j"$(nproc)"
+      - name: Demo NRO
+        run: make -C samples/switch-demo -j"$(nproc)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-nx
+          path: |
+            lib/libSQLite.a
+            include/sqlite3.h
+            include/sqlite3ext.h
+            samples/switch-demo/sqlite-nx-demo.nro

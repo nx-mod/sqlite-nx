@@ -27,8 +27,13 @@ ARCH	:=	-march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIC -ftls-model=local-exec
 
 CFLAGS	:=	-w -Os -D__SWITCH__ -ffunction-sections -fdata-sections $(ARCH) \
 			-DSQLITE_OMIT_WAL -DSQLITE_CORE -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_ENABLE_FTS4 \
-			-DSQLITE_THREADSAFE=0 -DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_OMIT_DEPRECATED \
-			-DSQLITE_OMIT_SHARED_CACHE
+			-DSQLITE_MAX_EXPR_DEPTH=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_SHARED_CACHE \
+			-DSQLITE_OS_OTHER=1 -DSQLITE_TEMP_STORE=3 \
+			-DSQLITE_THREADSAFE=1
+			# OS_OTHER: nx-vfs.c is the only VFS (the Unix one would clash with it).
+			# TEMP_STORE=3: temp files live in memory; the VFS has none.
+			# THREADSAFE: callers such as Aurora use one database from several threads;
+			# nx-vfs.c installs libnx mutexes for it (OS_OTHER ships only no-ops).
 
 			# devkitPro doesn't support dynamic libraries :/
 			# so they are disabled so it will compile :)

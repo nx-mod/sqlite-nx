@@ -1,2 +1,10 @@
 build/
 lib/
+
+# Switch build output
+build/
+lib/
+samples/*/build/
+samples/*/*.nro
+samples/*/*.nacp
+samples/*/*.elf
