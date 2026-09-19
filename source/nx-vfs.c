@@ -1,18 +1,19 @@
 #include "sqlite3.h"
 #include <switch.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
 // SQLite VFS on libnx's FsFileSystem, bypassing newlib's POSIX layer.
 //
 // - Paths are SD card paths: "/dir/file.db", or "sdmc:/dir/file.db".
-// - No file locking (Horizon has none), so one process per database.
+// - Locking is in-process only (Horizon has no file locks): any number of
+//   connections and threads in one process may share a database, but not two
+//   processes.
 // - No temp files: build with SQLITE_TEMP_STORE=3 so SQLite keeps them in memory.
 // - No shared memory, so no WAL: use journal_mode=MEMORY, DELETE or TRUNCATE.
 // - No dynamic libraries.
 
-// FsFileSystem used to interact with files on the SD card
-static FsFileSystem fs;
 
 // libnx takes paths relative to the filesystem root; accept the "sdmc:"
 // device prefix newlib users naturally pass.
@@ -26,25 +27,115 @@ static const char * nxPath(const char * path) {
 // Size of write buffer (in bytes)
 #define SQLITE_NXVFS_BUFFERSZ 8192
 
-// sqlite3_file * actually points to this structure
 typedef struct nxFile nxFile;
+
+// One per open database path, shared by every connection that has it open.
+// SQLite's lock levels map onto it as in os_unix.c: SHARED is a reader count,
+// RESERVED / PENDING / EXCLUSIVE belong to a single writer.
+// It also owns the file handle: Horizon refuses to open a file for writing
+// twice, so a second connection has to use the first one's handle.
+typedef struct nxLockEntry nxLockEntry;
+struct nxLockEntry {
+    nxLockEntry * next;
+    int refs;                   // Open files using this entry
+    int shared;                 // Files holding SHARED or above
+    nxFile * writer;            // File holding RESERVED or above, if any
+    FsFile file;                // Shared handle, valid while refs > 0
+    bool writable;
+    char path[FS_MAX_PATH];
+};
+static nxLockEntry * nxLocks = NULL;
+static Mutex nxLocksMutex;      // Zero-initialized libnx mutex is unlocked
+
+// sqlite3_file * actually points to this structure
 struct nxFile {
     sqlite3_file base;          // Base class
     FsFile file;                // NX (Horizon) file object
     char * buf;                 // Buffer for writes
     int bufSize;                // Number of bytes in buffer
     sqlite3_int64 bufOffset;    // Offset of bytes in buffer from buf[0]
+    nxLockEntry * lock;         // Main databases only; NULL means no locking
+    int lockLevel;              // SQLITE_LOCK_*
+    char * deletePath;          // SQLITE_OPEN_DELETEONCLOSE: removed by nxClose
 };
+
+static FsFileSystem fs;
 
 // Close a file
 static int nxFlushBuffer(nxFile * file);
+static int nxUnlock(sqlite3_file * pFile, int lock);
+
+// Finds or creates the entry for a database and makes sure its shared handle
+// is open. The handle is opened read/write whenever possible, even for a
+// read-only connection (SQLite enforces read-only itself), so connections that
+// arrive later can still write through it.
+static int nxLockAcquire(const char * path, bool needWrite, nxLockEntry ** out) {
+    int rc = SQLITE_OK;
+    mutexLock(&nxLocksMutex);
+    nxLockEntry * entry = nxLocks;
+    while (entry && strcmp(entry->path, path) != 0) {
+        entry = entry->next;
+    }
+    if (!entry) {
+        entry = (nxLockEntry *) calloc(1, sizeof(nxLockEntry));
+        if (!entry) {
+            rc = SQLITE_NOMEM;
+        } else if (R_SUCCEEDED(fsFsOpenFile(&fs, path, FsOpenMode_Read | FsOpenMode_Write | FsOpenMode_Append,
+                                             &entry->file))) {
+            entry->writable = true;
+        } else if (needWrite || R_FAILED(fsFsOpenFile(&fs, path, FsOpenMode_Read, &entry->file))) {
+            free(entry);
+            entry = NULL;
+            rc = SQLITE_CANTOPEN;
+        }
+        if (entry) {
+            strncpy(entry->path, path, sizeof(entry->path) - 1);
+            entry->next = nxLocks;
+            nxLocks = entry;
+        }
+    } else if (needWrite && !entry->writable) {
+        entry = NULL;                   // Read-only file, already open elsewhere
+        rc = SQLITE_CANTOPEN;
+    }
+    if (entry) {
+        entry->refs++;
+    }
+    mutexUnlock(&nxLocksMutex);
+    *out = entry;
+    return rc;
+}
+
+static void nxLockRelease(nxLockEntry * entry) {
+    mutexLock(&nxLocksMutex);
+    if (--entry->refs == 0) {
+        nxLockEntry ** link = &nxLocks;
+        while (*link != entry) {
+            link = &(*link)->next;
+        }
+        *link = entry->next;
+        fsFileClose(&entry->file);
+        free(entry);
+    }
+    mutexUnlock(&nxLocksMutex);
+}
 
 static int nxClose(sqlite3_file * pFile) {
     nxFile * file = (nxFile *) pFile;
     int rc = nxFlushBuffer(file);   // Buffered writes must reach the file
-    fsFileClose(&file->file);
     sqlite3_free(file->buf);
     file->buf = NULL;
+    if (file->lock) {
+        nxUnlock(pFile, SQLITE_LOCK_NONE);
+        nxLockRelease(file->lock);  // Closes the shared handle with its last user
+        file->lock = NULL;
+    } else {
+        fsFileClose(&file->file);
+    }
+    if (file->deletePath) {
+        fsFsDeleteFile(&fs, file->deletePath);
+        sqlite3_free(file->deletePath);
+        file->deletePath = NULL;
+    }
     return rc;
 }
 
@@ -54,12 +145,21 @@ static int nxRead(sqlite3_file * pFile, void * buf, int bytes, sqlite_int64 offs
     u64 read = 0;
     Result rc;
 
-    // Read from file
+    // Buffered writes first, or this would read what they are replacing
     nxFile * file = (nxFile *) pFile;
+    int tmp = nxFlushBuffer(file);
+    if (tmp != SQLITE_OK) {
+        return tmp;
+    }
     rc = fsFileRead(&file->file, offset, buf, bytes, FsReadOption_None, &read);
 
-    // Return IO error if result isn't good
     if (R_FAILED(rc)) {
+        // Horizon fails reads that start past the end; SQLite expects a short read
+        s64 size = 0;
+        if (R_SUCCEEDED(fsFileGetSize(&file->file, &size)) && offset >= size) {
+            memset(buf, 0, bytes);
+            return SQLITE_IOERR_SHORT_READ;
+        }
         return SQLITE_IOERR_READ;
     }
 
@@ -189,15 +289,67 @@ static int nxFileSize(sqlite3_file * pFile, sqlite_int64 * size) {
     return SQLITE_OK;
 }
 
-// All locking functions do nothing
-static int nxLock(sqlite3_file * pFile, int lock) {
+// In-process locks. SQLite asks for SHARED, RESERVED or EXCLUSIVE; PENDING is
+// the state an EXCLUSIVE request waits in: it keeps new readers out while the
+// existing ones finish, so the writer cannot be starved.
+static int nxLock(sqlite3_file * pFile, int level) {
+    nxFile * file = (nxFile *) pFile;
+    nxLockEntry * entry = file->lock;
+    if (!entry || file->lockLevel >= level) {
+        return SQLITE_OK;
+    }
+
+    int rc = SQLITE_OK;
+    mutexLock(&nxLocksMutex);
+    if (level == SQLITE_LOCK_SHARED) {
+        if (entry->writer && entry->writer->lockLevel >= SQLITE_LOCK_PENDING) {
+            rc = SQLITE_BUSY;
+        } else {
+            entry->shared++;
+            file->lockLevel = SQLITE_LOCK_SHARED;
+        }
+    } else if (entry->writer && entry->writer != file) {
+        rc = SQLITE_BUSY;
+    } else if (level == SQLITE_LOCK_RESERVED) {
+        entry->writer = file;
+        file->lockLevel = SQLITE_LOCK_RESERVED;
+    } else {
+        entry->writer = file;
+        if (entry->shared > 1) {
+            file->lockLevel = SQLITE_LOCK_PENDING;
+            rc = SQLITE_BUSY;
+        } else {
+            file->lockLevel = SQLITE_LOCK_EXCLUSIVE;
+        }
+    }
+    mutexUnlock(&nxLocksMutex);
+    return rc;
+}
+
+static int nxUnlock(sqlite3_file * pFile, int level) {
+    nxFile * file = (nxFile *) pFile;
+    nxLockEntry * entry = file->lock;
+    if (!entry || file->lockLevel <= level) {
+        return SQLITE_OK;
+    }
+
+    mutexLock(&nxLocksMutex);
+    if (file->lockLevel > SQLITE_LOCK_SHARED && entry->writer == file) {
+        entry->writer = NULL;
+    }
+    if (level == SQLITE_LOCK_NONE) {
+        entry->shared--;
+    }
+    file->lockLevel = level;
+    mutexUnlock(&nxLocksMutex);
     return SQLITE_OK;
 }
-static int nxUnlock(sqlite3_file * pFile, int lock) {
-    return SQLITE_OK;
-}
+
 static int nxCheckReservedLock(sqlite3_file * pFile, int * pResOut) {
-    *pResOut = 0;
+    nxFile * file = (nxFile *) pFile;
+    mutexLock(&nxLocksMutex);
+    *pResOut = file->lock && file->lock->writer != NULL;
+    mutexUnlock(&nxLocksMutex);
     return SQLITE_OK;
 }
 
@@ -267,15 +419,28 @@ static int nxOpen(sqlite3_vfs * vfs, const char * path, sqlite3_file * pFile, in
         mode |= FsOpenMode_Read | FsOpenMode_Write | FsOpenMode_Append;
     }
 
-    // Allocate memory for file object and open
     memset(pFile, 0, sizeof(nxFile));
-    rc = fsFsOpenFile(&fs, path, mode, &file->file);
-    if (R_FAILED(rc)) {
-        file->base.pMethods = NULL;     // Prevents nxClose being called
-        sqlite3_free(tmpBuf);
-        return SQLITE_CANTOPEN;
+    if (flags & SQLITE_OPEN_MAIN_DB) {
+        // Main databases share one handle per path (see nxLockEntry)
+        int lockRc = nxLockAcquire(path, (flags & SQLITE_OPEN_READWRITE) != 0, &file->lock);
+        if (lockRc != SQLITE_OK) {
+            file->base.pMethods = NULL;
+            sqlite3_free(tmpBuf);
+            return lockRc;
+        }
+        file->file = file->lock->file;
+    } else {
+        rc = fsFsOpenFile(&fs, path, mode, &file->file);
+        if (R_FAILED(rc)) {
+            file->base.pMethods = NULL;     // Prevents nxClose being called
+            sqlite3_free(tmpBuf);
+            return SQLITE_CANTOPEN;
+        }
     }
     file->buf = tmpBuf;
+    if (flags & SQLITE_OPEN_DELETEONCLOSE) {
+        file->deletePath = sqlite3_mprintf("%s", path);
+    }
 
     // Set output flags
     if (outFlags) {
@@ -384,7 +549,9 @@ static int nxMutexEnd(void) {
 }
 static sqlite3_mutex * nxMutexAlloc(int id) {
     if (id == SQLITE_MUTEX_FAST || id == SQLITE_MUTEX_RECURSIVE) {
-        sqlite3_mutex * mutex = (sqlite3_mutex *) sqlite3_malloc(sizeof(sqlite3_mutex));
+        // Plain malloc: SQLite allocates mutexes while it is still initializing,
+        // and sqlite3_malloc would re-enter sqlite3_initialize - forever.
+        sqlite3_mutex * mutex = (sqlite3_mutex *) malloc(sizeof(sqlite3_mutex));
         if (mutex) {
             rmutexInit(&mutex->lock);
         }
@@ -396,7 +563,7 @@ static sqlite3_mutex * nxMutexAlloc(int id) {
     return NULL;
 }
 static void nxMutexFree(sqlite3_mutex * mutex) {
-    sqlite3_free(mutex);
+    free(mutex);
 }
 static void nxMutexEnter(sqlite3_mutex * mutex) {
     rmutexLock(&mutex->lock);
