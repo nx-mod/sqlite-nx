@@ -38,3 +38,8 @@ The report is also written to `sdmc:/switch/sqlite-nx-demo.log`. All 21 pass on 
 1. Wire into wii-nx: build with `SQLITE_OS_OTHER=1` plus `nx-vfs.c`, and drop the workaround in Aurora.
 2. Add a small CMake file for devkitPro builds (only a Makefile and `build.sh` today).
 3. Journal mode stays `MEMORY` for the shader caches: fastest, and a lost cache only costs a recompile.
+
+## Releases
+
+Prebuilt packages are tagged `<upstream version>-nx-mod-v<n>`, the same convention across every nx-mod
+library, so a project can pin one line per dependency.
